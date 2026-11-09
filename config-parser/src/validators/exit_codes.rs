@@ -1,6 +1,6 @@
 use serde::{Deserialize};
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug,Deserialize, Clone, PartialEq, Eq)]
 #[serde(try_from="Vec<u8>")]
 pub struct ExitCodes {
 	pub values: Vec<u8>

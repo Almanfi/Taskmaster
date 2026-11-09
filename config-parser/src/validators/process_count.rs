@@ -1,7 +1,7 @@
 use serde::{Deserialize};
 
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(try_from="u64")]
 pub struct ProcessCount{
 	pub value: u64

@@ -10,7 +10,7 @@ pub trait OutputTargetsType {
 	fn validate(path: &mut PathBuf) -> Result<(), String>;
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(try_from="String")]
 pub struct OutputTarget<T> where T: OutputTargetsType{
 	pub target: PathBuf,
@@ -41,9 +41,9 @@ impl<T:OutputTargetsType> OutputTarget<T> {
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StdoutOutputTarget;
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StderrOutputTarget;
 
 pub type Stdout = OutputTarget<StdoutOutputTarget>;

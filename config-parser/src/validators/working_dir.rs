@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(try_from="String")]
 pub struct WorkingDir {
 	pub path: PathBuf

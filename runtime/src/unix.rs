@@ -12,6 +12,11 @@ pub const POLLNVAL:c_short = 0x020;
 pub const POLLHUP: c_short = 0x010;
 pub const POLLIN: c_short = 0x001;
 pub const POLLERR: c_short = 0x008;
+pub const SIGHUP: c_int = 1;
+pub const SIGINT: c_int = 2;
+pub const SIGQUIT: c_int = 3;
+pub const SIGKILL: c_int = 9;
+pub const SIGTERM: c_int = 15;
 pub const SIGCHLD: c_int = 17;
 pub const SA_NOCLDSTOP: c_int = 1;
 pub const WNOHANG: c_int = 1;
@@ -73,12 +78,23 @@ unsafe extern "C" {
 	#[cfg(test)]
 	fn raise(signum: c_int) -> c_int;
 	fn umask(mask: c_uint) -> c_uint;
+	fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
 pub fn set_umask(mask: u16) {
 	unsafe {
 		umask(mask.into());
 	}
+}
+
+pub fn send_signal(pid: c_int, sig: c_int) -> io::Result<()> {
+	let rc = unsafe {
+		kill(pid, sig)
+	};
+	if rc == -1 {
+		return Err(io::Error::last_os_error());
+	};
+	Ok(())
 }
 
 pub struct SelfPipe {
@@ -355,10 +371,12 @@ impl Drop for SigChldMaskGuard {
 
 #[cfg(test)]
 mod tests {
-	use super::{cleanup_sigchld_pipe, configure_sigchld_notifications, install_sigchld_handler, raise, reap_exited_children, sigaction, sigismember, sigprocmask, ChildTermination, SelfPipe, SigAction, SigChldMaskGuard, SigSet, SIGNAL_HANDLER_TEST_LOCK, SIG_BLOCK, SIGCHLD};
+	use super::{cleanup_sigchld_pipe, configure_sigchld_notifications, install_sigchld_handler, raise, reap_exited_children, sigaction, sigismember, sigprocmask, ChildTermination, SelfPipe, SigAction, SigChldMaskGuard, SigSet, SIGNAL_HANDLER_TEST_LOCK, SIG_BLOCK, SIGCHLD, send_signal, SIGTERM, SIGKILL};
 	use std::io;
 	use std::mem::MaybeUninit;
 	use std::process::Command;
+	use std::ffi::c_int;
+	use std::os::unix::process::ExitStatusExt;
 	struct RestoreSigchldAction {
 		action: SigAction,
 	}
@@ -637,6 +655,32 @@ mod tests {
 				.expect("unblocked SIGCHLD must notify the self-pipe")
 		);
 		pipe.drain().expect("self-pipe drain must succeed");
+	}
+
+	#[test]
+	fn send_signal_delivers_sigterm_to_a_running_child() {
+		let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+		let mut child = Command::new("/bin/sleep").arg("5")
+			.spawn().expect("sleep must spawn");
+		let pid = child.id() as c_int;
+
+		send_signal(pid, SIGTERM).expect("kill(SIGTERM) must succeed");
+
+		let status = child.wait().expect("child must be reaped");
+		assert_eq!(status.signal(), Some(SIGTERM));
+	}
+
+	#[test]
+	fn send_signal_sigkill_terminates_an_uncatchable_child() {
+		let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+		let mut child = Command::new("/bin/sleep").arg("5")
+			.spawn().expect("sleep must spawn");
+		let pid = child.id() as c_int;
+
+		send_signal(pid, SIGKILL).expect("kill(SIGKILL) must succeed");
+
+		let status = child.wait().expect("child must be reaped");
+		assert_eq!(status.signal(), Some(SIGKILL));
 	}
 }
 

@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(try_from = "HashMap<String, String>")]
 pub struct EnvironmentVariables {
 	pub values: HashMap<String, String>,

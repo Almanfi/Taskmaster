@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 use serde::{Deserialize};
 use std::os::unix::fs::PermissionsExt;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(try_from="String")]
 pub struct Command {
 	pub path: PathBuf,
