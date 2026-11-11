@@ -6,6 +6,7 @@ use std::ffi::{c_int, c_long, c_ulong, c_void, c_short};
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::mem::MaybeUninit;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -233,7 +234,7 @@ impl PerfCounter {
         // SAFETY: `attr.size` has just been set to the correct struct size,
         // satisfying the only precondition of `perf_event_open_raw`.
         let rc = unsafe {
-             perf_event_open_raw(attr, pid, cpu, Fd(-1), PERF_FLAG_FD_CLOEXEC) 
+            perf_event_open_raw(attr, pid, cpu, Fd(-1), PERF_FLAG_FD_CLOEXEC) 
         };
         if rc < 0 {
             return Err(io::Error::last_os_error());
@@ -469,15 +470,21 @@ impl PerfRing {
                 // Record wraps around the end — assemble into a scratch Vec.
                 let first = data_size - offset;
                 let second: usize = record_size - first;
-                let mut buf = Vec::<u8>::with_capacity(record_size);
-                // SAFETY: both source ranges are inside the ring; `buf` is
-                // owned by us and has reserved `record_size` bytes.
+                let mut buf = Vec::<MaybeUninit<u8>>::with_capacity(record_size);
+                // Now every byte is initialized.  Hand on_record a &[u8] view —
+                // no second allocation, no transmute of the Vec itself.
+                // SAFETY: buf is fully initialized above, lifetime bound to this scope.
                 unsafe {
                     buf.set_len(record_size);
-                    std::ptr::copy_nonoverlapping(data_base.add(offset), buf.as_mut_ptr(), first);
-                    std::ptr::copy_nonoverlapping(data_base, buf.as_mut_ptr().add(first), second);
+                    let dest = buf.as_mut_ptr() as *mut u8;
+                    std::ptr::copy_nonoverlapping(data_base.add(offset), dest, first);
+                    std::ptr::copy_nonoverlapping(data_base, dest.add(first), second);
                 }
-                on_record(&header, &buf);
+                // Now every byte is initialized.  Hand on_record a &[u8] view —
+                // no second allocation, no transmute of the Vec itself.
+                // SAFETY: buf is fully initialized above, lifetime bound to this scope.
+                let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8 , record_size)};
+                on_record(&header, bytes);
             }
             tail = tail.wrapping_add(record_size as u64);
             count += 1;

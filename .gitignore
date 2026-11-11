@@ -6,6 +6,8 @@
 *.swp
 .vscode/
 .idea/
+.cargo-cache
+target-docker
 
 #Environments
 .env

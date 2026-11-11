@@ -59,6 +59,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "config-parser",
+ "monitoring",
 ]
 
 [[package]]
