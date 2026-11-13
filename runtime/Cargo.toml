@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 config-parser = { path = "../config-parser" }
 monitoring = { path = "../monitoring" }
+shell = { path = "../shell" }

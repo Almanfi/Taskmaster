@@ -3,14 +3,18 @@ use std::ffi::{c_int, c_short};
 use std::thread::available_parallelism;
 use std::time::{Instant, Duration};
 use std::io;
-// use crate::process::RuntimeProcess;
-use crate::unix::{SIGKILL, send_signal};
+use std::sync::Arc;
+use crate::supervisor::ExitClass::{Expected, Unexpected};
+use crate::unix::{SIGKILL, send_signal, SelfPipe};
+use crate::log::Logger;
+use std::fmt;
 
 use config_parser::config::{Config, ProgramConfig};
+use config_parser::validators::RestartPolicy;
 use monitoring::{PERF_RECORD_EXIT, PERF_RECORD_FORK, POLLERR, POLLHUP, POLLIN, POLLNVAL, Pid, TaskEventRecord, w_exit_status, w_if_exited, w_if_signaled, w_term_sig, wait4pid};
 use monitoring::signalfd::block_sighup;
-// use monitoring::signalfd;
 use monitoring::{signalfd::SignalFd, PerfCounter, PerfRing, Poller};
+use shell::ShellCommand;
 
 /// Internal id for a program, stable for the Supervisor's lifetime.
 /// Keeps `pid_map` free of allocated strings.
@@ -39,6 +43,41 @@ pub enum SlotState {
     Backoff
 }
 
+impl fmt::Display for SlotState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SlotState::NotStarted => write!(f, "not started"),
+
+            SlotState::Starting { since } => {
+                write!(f, "starting ({}s:{}ms)", since.elapsed().as_secs(), since.elapsed().subsec_millis())
+            }
+
+            SlotState::Running { since } => {
+                write!(f, "running ({}s:{}ms)", since.elapsed().as_secs(), since.elapsed().subsec_millis())
+            }
+
+            SlotState::Stopping { since, deadline } => {
+                let now = Instant::now();
+                let elapsed   = since.elapsed().as_secs();
+                let remaining = deadline.saturating_duration_since(now).as_secs();
+                write!(f, "stopping ({elapsed}s:{}ms, kill in {remaining}s)", since.elapsed().subsec_millis())
+            }
+
+            SlotState::Exited { term, expected } => {
+                let tag = if *expected { "expected" } else { "unexpected" };
+                match term {
+                    Termination::Normal   { code } =>
+                        write!(f, "exited code={code} ({tag})"),
+                    Termination::Signaled { sig  } =>
+                        write!(f, "killed signal={sig} ({tag})"),
+                }
+            }
+
+            SlotState::Backoff => write!(f, "backoff"),
+        }
+    }
+}
+
 pub struct Slot {
     pub pid: Option<c_int>,
     pub state: SlotState,
@@ -61,6 +100,18 @@ pub enum SlotOp {
 pub enum Phase {
     WaitingRunning   {idx: usize},
     WaitingExit     {idx: usize, respawn: bool}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitClass {
+    Expected,
+    Unexpected
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartDecision {
+    None,
+    Restart
 }
 
 #[derive(Debug, Default)]
@@ -102,7 +153,10 @@ pub struct Supervisor {
     pub rings: Vec<PerfRing>,
     pub counters: Vec<PerfCounter>,
     pub sighup: Option<SignalFd>,
-    pub poller: Poller
+    pub inbox: Option<Arc<SelfPipe>>,
+    pub poller: Poller,
+
+    pub logger: Logger
 }
 
 impl Supervisor {
@@ -127,8 +181,18 @@ impl Supervisor {
             rings: Vec::new(),
             counters: Vec::new(),
             sighup: None,
+            inbox: None,
             poller: Poller::new(),
+
+            logger: Logger::null()
         }
+    }
+
+    pub fn setup_inbox(&mut self) -> io::Result<Arc<SelfPipe>> {
+        let pipe = Arc::new(SelfPipe::new()?);
+        self.poller.register(pipe.read_fd());
+        self.inbox = Some(pipe.clone());
+        Ok(pipe)
     }
 
     /// Spawn one slot under its program's current cfg.
@@ -145,9 +209,14 @@ impl Supervisor {
             let mut rp = crate::process::RuntimeProcess::new(conf);
             rp.start().map_err(|e| io::Error::other(e.to_string()))? as c_int
         };
+        self.log(&format!(
+            "spawn program={} slot={} pid={}",
+            self.program_names(program), slot_idx, pid
+        ));
         let slot = &mut self.programs[prog_idx].slots[slot_idx];
         slot.pid = Some(pid);
         slot.state = SlotState::Starting { since: (Instant::now()) };
+        slot.tries = slot.tries.saturating_add(1);
         
         self.pid_map.insert(pid, PidKey { program, slot: slot_idx });
         Ok(())
@@ -180,10 +249,41 @@ impl Supervisor {
 
         send_signal(pid, sig)?;
 
+        self.log(&format!(
+            "stop program={} slot={} pid={} sig={}",
+            self.program_names(program), slot_idx, pid, sig
+        ));
+
         let now = Instant::now();
         let slot = &mut self.programs[prog_idx].slots[slot_idx];
         slot.state = SlotState::Stopping { since: now, deadline: now + Duration::from_secs(kill_time) };
         Ok(())
+    }
+
+    /// Append a restart for one slot.  If a walk is already in flight,
+    /// enqueue onto its tail; otherwise start a fresh one-op walk.
+    pub fn restart_slot(&mut self, pid: ProgramId, idx: usize) {
+        let name =  self.program_names(pid).to_string();
+        let prog = &mut self.programs[pid.0 as usize];
+        let restart_count = prog.cfg.restart_count;
+        let tries = prog.slots[idx].tries;
+        let logger = &mut self.logger;
+        
+        if tries >= restart_count {
+            prog.slots[idx].state = SlotState::Backoff;
+            logger.log(&format!(
+                "backoff program={name} slot={idx} tries={tries}"
+            ));
+            return ; 
+        }
+        logger.log(&format!(
+            "restart program={name} slot={idx} try={}", tries + 1
+        ));
+
+        match &mut prog.pending {
+            Some(p) => p.queue.push_back(SlotOp::Spawn(idx)),
+            None => prog.pending = Some(Pending::grow(idx, idx + 1))
+        }
     }
 
     /// Enforce per-slot deadlines.
@@ -194,14 +294,31 @@ impl Supervisor {
     /// is already gone) are intentionally swallowed; there's nothing
     /// useful to do about them at this layer.
     pub fn tick(&mut self, now: Instant) {
-        for prog in &self.programs {
-            for slot in &prog.slots {
+        let mut kill_events: Vec<(usize, usize, c_int)> = Vec::new();
+        for (prog_idx, prog) in &mut self.programs.iter_mut().enumerate() {
+            let runtime = Duration::from_secs(prog.cfg.runtime as u64);
+            for (slot_idx, slot) in &mut prog.slots.iter_mut().enumerate() {
+                // Starting → Running after the configured starttime window.
+                if let SlotState::Starting { since } = slot.state
+                    && now.duration_since(since) >= runtime {
+                    slot.state = SlotState::Running { since };
+                    slot.tries = 0;
+                }
+                // SIGKILL escalation (unchanged from S07).
                 if let SlotState::Stopping { deadline, .. } = slot.state 
                     && now >= deadline
                     && let Some(pid) = slot.pid {
-                        let _ = send_signal(pid, SIGKILL);   
+                        let _ = send_signal(pid, SIGKILL);
+                        kill_events.push((prog_idx, slot_idx, pid))
                 }
             }
+        }
+
+        for (prog_idx, slot_idx, pid) in kill_events {
+            let name = self.program_names(ProgramId(prog_idx as u32));
+            self.log(&format!(
+                "Term program={name} slot={slot_idx} pid={pid}"
+            ));
         }
     }
 
@@ -281,7 +398,9 @@ impl Supervisor {
                     }
                 }
                 Some(Phase::WaitingRunning { idx }) => {
-                    if !self.has_stabilized(pid, idx, now) {
+                    let state = self.programs[prog_idx].slots[idx].state;
+                    let failed = matches!(state, SlotState::Exited { .. } | SlotState::Backoff);
+                    if !failed && !self.has_stabilized(pid, idx, now) {
                         return Ok(());
                     }
                     self.clear_current(pid);
@@ -369,7 +488,6 @@ impl Supervisor {
     /// `exit_codes` is S15's job.
     fn reap_and_dispatch(&mut self, pid: c_int) -> io::Result<()> {
         let status = wait4pid(pid, 0)?;
-
         let termination = if w_if_exited(status) {
             Termination::Normal { code: w_exit_status(status) }
         } else if w_if_signaled(status) {
@@ -383,9 +501,26 @@ impl Supervisor {
             None => return Ok(()),
         };
 
+        let class = self.classify_exit(key.program, termination);
+        let expected = class == ExitClass::Expected;
+
         let slot = &mut self.programs[key.program.0 as usize].slots[key.slot];
         slot.pid = None;
-        slot.state = SlotState::Exited { term: termination, expected: false };
+        slot.state = SlotState::Exited { term: termination, expected };
+
+        let name = self.program_names(key.program).to_string();
+        let description = match termination {
+            Termination::Normal { code } => format!("code={code} expected={expected}"),
+            Termination::Signaled { sig } => format!("signal={sig}")
+        };
+        self.log(&format!(
+            "exit program={name} slot={} pid={pid} {description}",
+            key.slot
+        ));
+
+        if matches!(self.decide_restart(key.program, class), RestartDecision::Restart) {
+            self.restart_slot(key.program, key.slot);
+        }
         Ok(())
     }
 
@@ -436,14 +571,20 @@ impl Supervisor {
 
         // 5. Dispatch events
         let n_rings = self.rings.len();
+        let sighup_idx = n_rings;
+
         for (i, revents) in ready_pairs {
             if revents & (POLLERR | POLLNVAL) != 0 { continue; }
             if revents & (POLLIN | POLLHUP) == 0 { continue; }
 
             if i < n_rings {
                 self.drain_ring(i)?;
-            } else {
+            } else if i == sighup_idx{
                 self.drain_sighup()?;
+            } else {
+                if let Some(inbox) = &self.inbox {
+                    let _ = inbox.drain();
+                }
             }
         }
         Ok(())
@@ -461,6 +602,105 @@ impl Supervisor {
         self.programs[pid.0 as usize].pending = Some(Pending::shrink(from, to));
     }
 
+    /// For every program whose cfg has `auto_start == true`, enqueue a
+    /// grow walk from 0 to `process_count`.
+    ///
+    /// Nothing spawns here — the driver inside `step()` kicks the walks off.
+    /// Call once, right after `bootstrap`.
+    pub fn auto_start(&mut self) {
+        for i in 0..self.programs.len() {
+            let cfg = &self.programs[i].cfg;
+            if !cfg.auto_start { continue; }
+            let count = cfg.process_count.value as usize;
+            for slot in 0..count {
+                let _ = self.spawn_slot(ProgramId(i as u32), slot);
+            }
+        }
+    }
+
+    pub fn classify_exit(&self, pid: ProgramId, term: Termination) -> ExitClass {
+        let cfg = &self.programs[pid.0 as usize].cfg;
+        match term {
+            Termination::Normal { code } if cfg.exit_codes.values.contains(&(code as u8)) => Expected,
+            _ => Unexpected
+        }
+    }
+
+    pub fn decide_restart(&self, pid: ProgramId, class: ExitClass) -> RestartDecision {
+        let cfg = &self.programs[pid.0 as usize].cfg;
+        match cfg.restart_protocol {
+            RestartPolicy::Always       => RestartDecision::Restart,
+            RestartPolicy::Never        => RestartDecision::None,
+            RestartPolicy::Unexpected   => { 
+                if class == ExitClass::Unexpected   { RestartDecision::Restart }
+                else                                { RestartDecision::None}
+            }
+        }
+    }
+
+    pub fn program_names(&self, id: ProgramId) -> &str {
+        self.names.iter()
+            .find_map(|(name, pid)| (*pid == id).then_some(name.as_str()))
+            .unwrap_or("?")
+    }
+
+    fn log(&mut self, msg: &str) {
+        self.logger.log(msg)
+    }
+
+    pub fn apply_command(&mut self, command: ShellCommand) -> String {
+        match command {
+            ShellCommand::Status => self.report_status(),
+            ShellCommand::Start(name) => match self.names.get(&name) {
+                Some(id) => {
+                    let count = self.programs[id.0 as usize].cfg.process_count.value as usize;
+                    self.enqueue_grow(*id, 0, count);
+                    format!("started {count} instances of program {name}")
+                }
+                None => format!("unknown program: {name}")
+            }
+            ShellCommand::Stop(name) => match self.names.get(&name) {
+                Some(id) => {
+                    self.stop_all(*id);
+                    format!("stopping {name}")
+                }
+                None => format!("unknown program: {name}")
+            }
+            ShellCommand::Restart(name) => match self.names.get(&name) {
+                Some(id) => {
+                    let count = self.programs[id.0 as usize].cfg.process_count.value as usize;
+                    self.enqueue_replace_all(*id, count);
+                    format!("restarting {name}")
+                }
+                None => format!("unknown program: {name}")
+            }
+            ShellCommand::Reload => "reloading configuration".into(),
+            ShellCommand::Quit => "quitting ...".into()
+        }
+    }
+
+    fn report_status(&self) -> String {
+        let mut out = String::new();
+
+        let mut names: Vec<&String> = self.names.keys().collect();
+        names.sort();
+
+        for name in names {
+            let id = self.names[name];
+            let prog = &self.programs[id.0 as usize];
+            for (i, slot) in prog.slots.iter().enumerate() {
+                out.push_str(&format!("{name}[{i}]: {}\n", slot.state));
+            }
+        }
+        out
+    }
+
+    pub fn stop_all(&mut self, pid: ProgramId) {
+        let count = self.programs[pid.0 as usize].slots.len();
+        for i in 0..count {
+            let _ = self.stop_slot(pid, i);
+        }
+    }
 
 }
 
@@ -765,7 +1005,7 @@ mod tests {
         let slot = &sup.programs[id.0 as usize].slots[0];
         assert!(matches!(
             slot.state,
-            SlotState::Exited { term: Termination::Normal { code: 0 }, expected: false }
+            SlotState::Exited { term: Termination::Normal { code: 0 }, expected: true }
         ));
         assert!(slot.pid.is_none());
         assert!(!sup.pid_map.contains_key(&pid));
@@ -856,5 +1096,341 @@ mod tests {
             let any_alive = sup.programs[id.0 as usize].slots.iter().any(|s| s.pid.is_some());
             if !any_alive { break; }
         }
+    }
+
+    #[test]
+    fn auto_start_spawns_slots_for_auto_start_programs_only() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+
+        let mut raw = Config { program: HashMap::new() };
+
+        let mut auto_cfg = program_cfg(2);
+        auto_cfg.command    = Command::try_from("/bin/sleep 10".to_string()).unwrap();
+        auto_cfg.runtime    = 0;
+        auto_cfg.auto_start = true;
+        raw.program.insert("auto".into(), auto_cfg);
+
+        let mut manual_cfg = program_cfg(1);
+        manual_cfg.command    = Command::try_from("/bin/sleep 10".to_string()).unwrap();
+        manual_cfg.auto_start = false;
+        raw.program.insert("manual".into(), manual_cfg);
+
+        let mut sup = Supervisor::new(raw);
+        sup.bootstrap().expect("bootstrap");
+        sup.auto_start();
+
+        let auto_id   = sup.names["auto"];
+        let manual_id = sup.names["manual"];
+        
+        // after sup.autostart():
+        assert!(matches!(sup.programs[auto_id.0 as usize].slots[0].state,
+            SlotState::Starting { .. }));
+        assert!(matches!(sup.programs[auto_id.0 as usize].slots[1].state,
+            SlotState::Starting { .. }));
+        // manual program still untouched:
+        assert!(matches!(sup.programs[manual_id.0 as usize].slots[0].state,
+            SlotState::NotStarted));
+
+        // Cleanup — kill running processes so zombies don't leak into later tests.
+        use crate::unix::{send_signal, SIGKILL};
+        for p in &sup.programs {
+            for s in &p.slots {
+                if let Some(pid) = s.pid {
+                    let _ = send_signal(pid, SIGKILL);
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            sup.step().ok();
+            let any_alive = sup.programs.iter()
+                .flat_map(|p| p.slots.iter()).any(|s| s.pid.is_some());
+            if !any_alive { break; }
+        }
+    }
+
+    #[test]
+    fn tick_transitions_starting_to_running_once_starttime_elapses() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+
+        let mut raw = Config { program: HashMap::new() };
+        let mut c = program_cfg(1);
+        c.command = Command::try_from("/bin/sleep 10".to_string()).unwrap();
+        c.runtime = 0;                                // instant stabilization
+        raw.program.insert("fast".into(), c);
+
+        let mut sup = Supervisor::new(raw);
+        sup.bootstrap().expect("bootstrap");
+        let id = sup.names["fast"];
+        sup.spawn_slot(id, 0).expect("spawn");
+
+        assert!(matches!(sup.programs[id.0 as usize].slots[0].state, SlotState::Starting { .. }));
+
+        sup.tick(Instant::now());
+
+        assert!(matches!(sup.programs[id.0 as usize].slots[0].state, SlotState::Running { .. }));
+
+        // Cleanup
+        use crate::unix::{send_signal, SIGKILL};
+        if let Some(pid) = sup.programs[id.0 as usize].slots[0].pid {
+            let _ = send_signal(pid, SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            sup.step().ok();
+            if sup.programs[id.0 as usize].slots[0].pid.is_none() { break; }
+        }
+    }
+
+    #[test]
+    fn tick_keeps_slot_starting_before_starttime_window_elapses() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+
+        let mut raw = Config { program: HashMap::new() };
+        let mut c = program_cfg(1);
+        c.command = Command::try_from("/bin/sleep 10".to_string()).unwrap();
+        c.runtime = 60;                               // 60-second window
+        raw.program.insert("slow".into(), c);
+
+        let mut sup = Supervisor::new(raw);
+        sup.bootstrap().expect("bootstrap");
+        let id = sup.names["slow"];
+        sup.spawn_slot(id, 0).expect("spawn");
+
+        sup.tick(Instant::now());
+
+        assert!(matches!(sup.programs[id.0 as usize].slots[0].state, SlotState::Starting { .. }),
+                "slot must stay Starting while inside the window");
+
+        // Cleanup
+        use crate::unix::{send_signal, SIGKILL};
+        if let Some(pid) = sup.programs[id.0 as usize].slots[0].pid {
+            let _ = send_signal(pid, SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            sup.step().ok();
+            if sup.programs[id.0 as usize].slots[0].pid.is_none() { break; }
+        }
+    }
+
+    #[test]
+    fn classify_exit_matches_against_exit_codes() {
+        let mut raw = Config { program: HashMap::new() };
+        let mut c = program_cfg(1);
+        c.exit_codes = ExitCodes::try_from(vec![0, 7]).unwrap();
+        raw.program.insert("p".into(), c);
+
+        let sup = Supervisor::new(raw);
+        let id  = sup.names["p"];
+
+        assert_eq!(sup.classify_exit(id, Termination::Normal { code: 0 }),  ExitClass::Expected);
+        assert_eq!(sup.classify_exit(id, Termination::Normal { code: 7 }),  ExitClass::Expected);
+        assert_eq!(sup.classify_exit(id, Termination::Normal { code: 1 }),  ExitClass::Unexpected);
+        assert_eq!(sup.classify_exit(id, Termination::Signaled { sig: 15 }), ExitClass::Unexpected);
+    }
+
+    #[test]
+    fn decide_restart_applies_the_configured_policy() {
+        use config_parser::validators::RestartPolicy;
+        for policy in [RestartPolicy::Always, RestartPolicy::Never, RestartPolicy::Unexpected] {
+            let mut raw = Config { program: HashMap::new() };
+            let mut c = program_cfg(1);
+            c.restart_protocol = policy;
+            raw.program.insert("p".into(), c);
+
+            let sup = Supervisor::new(raw);
+            let id  = sup.names["p"];
+
+            let on_exp   = sup.decide_restart(id, ExitClass::Expected);
+            let on_unexp = sup.decide_restart(id, ExitClass::Unexpected);
+
+            match policy {
+                RestartPolicy::Always => {
+                    assert_eq!(on_exp,   RestartDecision::Restart);
+                    assert_eq!(on_unexp, RestartDecision::Restart);
+                }
+                RestartPolicy::Never => {
+                    assert_eq!(on_exp,   RestartDecision::None);
+                    assert_eq!(on_unexp, RestartDecision::None);
+                }
+                RestartPolicy::Unexpected => {
+                    assert_eq!(on_exp,   RestartDecision::None);
+                    assert_eq!(on_unexp, RestartDecision::Restart);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn never_policy_leaves_slot_exited_without_restart() {
+        use config_parser::validators::RestartPolicy;
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+
+        let mut raw = Config { program: HashMap::new() };
+        let mut c = program_cfg(1);
+        c.command          = Command::try_from("/bin/true".to_string()).unwrap();
+        c.restart_protocol = RestartPolicy::Never;
+        c.exit_codes       = ExitCodes::try_from(vec![0]).unwrap();
+        c.runtime          = 0;
+        raw.program.insert("p".into(), c);
+
+        let mut sup = Supervisor::new(raw);
+        sup.bootstrap().expect("bootstrap");
+        let id = sup.names["p"];
+        sup.spawn_slot(id, 0).expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            sup.step().ok();
+            if matches!(sup.programs[id.0 as usize].slots[0].state, SlotState::Exited { .. }) {
+                break;
+            }
+        }
+
+        assert!(matches!(
+            sup.programs[id.0 as usize].slots[0].state,
+            SlotState::Exited { expected: true, .. }
+        ));
+        assert!(sup.programs[id.0 as usize].pending.is_none(),
+                "Never policy must not enqueue a restart");
+    }
+
+    #[test]
+    fn successful_stabilization_resets_tries_counter() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+
+        let mut raw = Config { program: HashMap::new() };
+        let mut c = program_cfg(1);
+        c.command = Command::try_from("/bin/sleep 10".to_string()).unwrap();
+        c.runtime = 0;
+        raw.program.insert("p".into(), c);
+
+        let mut sup = Supervisor::new(raw);
+        sup.bootstrap().expect("bootstrap");
+        let id = sup.names["p"];
+        sup.spawn_slot(id, 0).expect("spawn");
+
+        assert_eq!(sup.programs[id.0 as usize].slots[0].tries, 1);
+
+        sup.tick(Instant::now());
+
+        assert_eq!(sup.programs[id.0 as usize].slots[0].tries, 0);
+
+        use crate::unix::{send_signal, SIGKILL};
+        if let Some(pid) = sup.programs[id.0 as usize].slots[0].pid {
+            let _ = send_signal(pid, SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            sup.step().ok();
+            if sup.programs[id.0 as usize].slots[0].pid.is_none() { break; }
+        }
+    }
+
+    #[test]
+    fn startretries_reaches_backoff_after_restart_count_failures() {
+        use config_parser::validators::RestartPolicy;
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+
+        let mut raw = Config { program: HashMap::new() };
+        let mut c = program_cfg(1);
+        c.command          = Command::try_from("/bin/false".to_string()).unwrap();  // exits with 1
+        c.restart_protocol = RestartPolicy::Always;
+        c.restart_count    = 3;
+        c.exit_codes       = ExitCodes::try_from(vec![0]).unwrap();
+        c.runtime          = 60;                           // huge window — every exit is a failed start
+        raw.program.insert("p".into(), c);
+
+        let mut sup = Supervisor::new(raw);
+        sup.bootstrap().expect("bootstrap");
+        let id = sup.names["p"];
+        sup.spawn_slot(id, 0).expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            sup.step().ok();
+            if matches!(sup.programs[id.0 as usize].slots[0].state, SlotState::Backoff) {
+                break;
+            }
+        }
+
+        assert!(matches!(
+            sup.programs[id.0 as usize].slots[0].state,
+            SlotState::Backoff
+        ));
+        assert_eq!(sup.programs[id.0 as usize].slots[0].tries, 3,
+                "exactly restart_count attempts were made");
+    }
+
+    #[test]
+    fn logger_captures_spawn_and_exit_events() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+
+        let log_path = std::env::temp_dir().join(format!(
+            "taskmaster-log-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        let mut raw = Config { program: HashMap::new() };
+        let mut c = program_cfg(1);
+        c.command          = Command::try_from("/bin/true".to_string()).unwrap();
+        c.restart_protocol = config_parser::validators::RestartPolicy::Never;
+        c.exit_codes       = ExitCodes::try_from(vec![0]).unwrap();
+        c.runtime          = 0;
+        raw.program.insert("quick".into(), c);
+
+        let mut sup = Supervisor::new(raw);
+        sup.logger = crate::log::Logger::open(&log_path).expect("open log");
+        sup.bootstrap().expect("bootstrap");
+
+        let id = sup.names["quick"];
+        sup.spawn_slot(id, 0).expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            sup.step().ok();
+            if matches!(sup.programs[id.0 as usize].slots[0].state, SlotState::Exited { .. }) {
+                break;
+            }
+        }
+
+        drop(sup);                              // closes the log file
+
+        let content = std::fs::read_to_string(&log_path).expect("log must exist");
+        assert!(content.contains("spawn program=quick slot=0"),
+                "log missing spawn line\n{content}");
+        assert!(content.contains("exit program=quick slot=0"),
+                "log missing exit line\n{content}");
+
+        std::fs::remove_file(&log_path).ok();
+    }
+
+    #[test]
+    fn apply_command_start_enqueues_grow() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+        let mut raw = Config { program: HashMap::new() };
+        raw.program.insert("web".into(), program_cfg(2));
+
+        let mut sup = Supervisor::new(raw);
+        let resp = sup.apply_command(shell::ShellCommand::Start("web".into()));
+
+        let id = sup.names["web"];
+        assert!(sup.programs[id.0 as usize].pending.is_some(),
+                "start must enqueue a walk");
+        assert!(resp.contains("program web"));
+        assert!(resp.contains("2 instances"));
+    }
+
+    #[test]
+    fn apply_command_unknown_program_reports_error() {
+        let mut raw = Config { program: HashMap::new() };
+        raw.program.insert("web".into(), program_cfg(1));
+        let mut sup = Supervisor::new(raw);
+
+        let resp = sup.apply_command(shell::ShellCommand::Stop("db".into()));
+        assert!(resp.contains("unknown program: db"));
     }
 }

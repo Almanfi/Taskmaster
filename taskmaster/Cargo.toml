@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 config-parser = { path = "../config-parser" }
 runtime = { path = "../runtime" }
+shell = { path = "../shell" }
+rustyline = "19.0"

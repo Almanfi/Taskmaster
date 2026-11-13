@@ -1,12 +1,12 @@
 [program.Test]
-command = "/bin/ls"
+command = "/usr/bin/sleep 10"
 chdir = "./config-parser"
 umask = "111"
 process_count = 3
 auto_start = true
 restart_protocol = "never"
 exit_codes = [100, 2]
-runtime = 5
+runtime = 0
 restart_count = 3
 exit_signal = "TERM"
 kill_time = 10

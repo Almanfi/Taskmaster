@@ -5,3 +5,5 @@ pub mod unix;
 
 #[cfg(target_os = "linux")]
 pub mod supervisor;
+
+pub mod log;

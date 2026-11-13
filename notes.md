@@ -1,0 +1,1 @@
+- for now retries are program driven. meaning a program with 3 replicas share it amongs its slots
