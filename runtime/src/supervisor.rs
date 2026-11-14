@@ -16,6 +16,8 @@ use monitoring::signalfd::block_sighup;
 use monitoring::{signalfd::SignalFd, PerfCounter, PerfRing, Poller};
 use shell::ShellCommand;
 
+pub const SUPERVISOR_TIMEOUT_SEC: u64 = 30;
+
 /// Internal id for a program, stable for the Supervisor's lifetime.
 /// Keeps `pid_map` free of allocated strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,6 +116,12 @@ pub enum RestartDecision {
     Restart
 }
 
+pub enum SpawnResult {
+    Spawned,
+    AlredyRunning,
+    Stopping,
+}
+
 #[derive(Debug, Default)]
 pub struct Pending {
     pub queue: VecDeque<SlotOp>,
@@ -156,7 +164,9 @@ pub struct Supervisor {
     pub inbox: Option<Arc<SelfPipe>>,
     pub poller: Poller,
 
-    pub logger: Logger
+    pub logger: Logger,
+
+    pub shutdown_deadline: Option<Instant>
 }
 
 impl Supervisor {
@@ -184,7 +194,9 @@ impl Supervisor {
             inbox: None,
             poller: Poller::new(),
 
-            logger: Logger::null()
+            logger: Logger::null(),
+
+            shutdown_deadline: None
         }
     }
 
@@ -200,8 +212,19 @@ impl Supervisor {
     /// Low-level primitive: not called by bootstrap or reload directly.
     /// Caller (the rolling driver) ensures the slot is in NotStarted,
     /// Exited, or Backoff when this is invoked.
-    pub fn spawn_slot(&mut self, program: ProgramId, slot_idx: usize) -> io::Result<()> {
+    pub fn spawn_slot(&mut self, program: ProgramId, slot_idx: usize) -> io::Result<SpawnResult> {
         let prog_idx = program.0 as usize;
+        let state = self.programs[prog_idx].slots[slot_idx].state;
+
+        match state {
+            SlotState::Starting { .. } | SlotState::Running { .. } => {
+                return Ok(SpawnResult::AlredyRunning);
+            }
+            SlotState::Stopping { .. } => {
+                return Ok(SpawnResult::Stopping);
+            }
+            _ => {}
+        }
 
         // Scope the cfg borrow so we can take &mut self for the recording step.
         let pid = {
@@ -219,7 +242,7 @@ impl Supervisor {
         slot.tries = slot.tries.saturating_add(1);
         
         self.pid_map.insert(pid, PidKey { program, slot: slot_idx });
-        Ok(())
+        Ok(SpawnResult::Spawned)
     }
 
     /// Ask one slot to stop.
@@ -535,12 +558,19 @@ impl Supervisor {
 
     fn next_timeout_ms(&self) -> c_int {
         let now = Instant::now();
-        let soonest = self.programs.iter()
+        let soonest_stop = self.programs.iter()
             .flat_map(|p| p.slots.iter())
             .filter_map(|s| match s.state {
                 SlotState::Stopping { deadline, ..} => Some(deadline),
                 _ => None,
             }).min();
+        
+        let soonest = match (soonest_stop, self.shutdown_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None
+        };
     
         match soonest {
             None                             => -1,
@@ -644,18 +674,35 @@ impl Supervisor {
             .unwrap_or("?")
     }
 
-    fn log(&mut self, msg: &str) {
+    pub fn log(&mut self, msg: &str) {
         self.logger.log(msg)
     }
 
     pub fn apply_command(&mut self, command: ShellCommand) -> String {
         match command {
             ShellCommand::Status => self.report_status(),
-            ShellCommand::Start(name) => match self.names.get(&name) {
+            ShellCommand::Start(name) => match self.names.get(&name).copied() {
                 Some(id) => {
                     let count = self.programs[id.0 as usize].cfg.process_count.value as usize;
-                    self.enqueue_grow(*id, 0, count);
-                    format!("started {count} instances of program {name}")
+                    let mut started: usize = 0;
+                    let mut running: usize = 0;
+                    let mut stopping: usize = 0;
+                    
+                    for slot in 0..count {
+                        match self.spawn_slot(id, slot) {
+                            Ok(SpawnResult::Spawned) => started += 1,
+                            Ok(SpawnResult::AlredyRunning) => running += 1,
+                            Ok(SpawnResult::Stopping) => stopping += 1,
+                            Err(e) => self.log(
+                                &format!("failed to spawn slot {slot} of program {name}: {e}")
+                            ),
+                        }
+                    }
+                    let mut out: Vec<String> = Vec::new();
+                    if started > 0 { out.push(format!("started {started} instances")); }
+                    if running > 0 { out.push(format!("{running} instances already running")); }
+                    if stopping > 0 { out.push(format!("{stopping} instances stopping")); }
+                    format!("program {name}: {}", out.join(", "))
                 }
                 None => format!("unknown program: {name}")
             }
@@ -675,7 +722,10 @@ impl Supervisor {
                 None => format!("unknown program: {name}")
             }
             ShellCommand::Reload => "reloading configuration".into(),
-            ShellCommand::Quit => "quitting ...".into()
+            ShellCommand::Quit => {
+                self.begin_shutdown(Duration::from_secs(SUPERVISOR_TIMEOUT_SEC));
+                "quitting ...".into()
+            }
         }
     }
 
@@ -702,6 +752,25 @@ impl Supervisor {
         }
     }
 
+    pub fn begin_shutdown(&mut self, timeout: Duration) {
+        let program_ids: Vec<_> = self.names.values().copied().collect();
+        for pid in program_ids { self.stop_all(pid); }
+        self.shutdown_deadline = Some(Instant::now() + timeout);
+        self.log("shutdown initiated");
+    }
+
+    pub fn is_shutdown_done(&self) -> bool {
+        let Some(deadline) = self.shutdown_deadline else { return false };
+        let pending = self.programs.iter()
+            .flat_map(|p| p.slots.iter())
+            .any(|s| matches!{
+                s.state,
+                SlotState::Starting { .. } |
+                SlotState::Running { .. } |
+                SlotState::Stopping { .. }
+            });
+        !pending || Instant::now() >= deadline
+    }
 }
 
 #[cfg(test)]

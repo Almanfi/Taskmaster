@@ -40,6 +40,27 @@ pub fn parse(line: &str) -> Result<ShellCommand, ParseError> {
     Ok(result)
 }
 
+pub struct Reader {
+    editor: rustyline::DefaultEditor
+}
+
+impl Reader {
+    pub fn new() -> rustyline::Result<Self> {
+        Ok(Self { editor: rustyline::DefaultEditor::new()? })
+    }
+
+    pub fn readline(&mut self) -> Option<Result<ShellCommand, ParseError>> {
+        match self.editor.readline("taskmaster> ") {
+            Ok(line) => {
+                if line.trim().is_empty() { return self.readline(); }
+                let _ = self.editor.add_history_entry(&line);
+                Some(parse(&line))
+            }
+            Err(_) => None
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

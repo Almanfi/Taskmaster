@@ -3,7 +3,9 @@ set -euo pipefail
 
 IMAGE="taskmaster-dev"
 
-docker build --platform linux/amd64 -f Dockerfile.dev -t "$IMAGE" .
+if [[ "${REBUILD:-0}" == "1" ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    docker build --platform linux/amd64 -f Dockerfile.dev -t "$IMAGE" .
+fi
 
 exec docker run -it --rm \
   --platform linux/amd64 \
