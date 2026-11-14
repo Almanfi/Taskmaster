@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -18,12 +19,14 @@ fn main() -> Result<(), Box<dyn std::error::Error> > {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error> > {
-	let mut config_reader = ConfigReader::new("./Run.toml");
+    let conf_path =  "./Run.toml";
+	let mut config_reader = ConfigReader::new(conf_path);
 	config_reader.read()?;
 	let configs = config_reader.parse::<Config>()?;
 
     let mut sup = Supervisor::new(configs);
     sup.logger = Logger::open("taskmaster.log")?;
+    sup.conf_path = PathBuf::from(conf_path);
     sup.log(" ----- Taskmaster started -----");
     sup.bootstrap()?;
     sup.auto_start();

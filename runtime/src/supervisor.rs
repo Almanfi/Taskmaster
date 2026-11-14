@@ -1,20 +1,24 @@
 use std::collections::{ HashMap, VecDeque};
 use std::ffi::{c_int, c_short};
+use std::path::PathBuf;
 use std::thread::available_parallelism;
 use std::time::{Instant, Duration};
 use std::io;
 use std::sync::Arc;
+use crate::diff::{ConfigDiff, DiffAction};
 use crate::supervisor::ExitClass::{Expected, Unexpected};
 use crate::unix::{SIGKILL, send_signal, SelfPipe};
 use crate::log::Logger;
 use std::fmt;
 
 use config_parser::config::{Config, ProgramConfig};
-use config_parser::validators::RestartPolicy;
-use monitoring::{PERF_RECORD_EXIT, PERF_RECORD_FORK, POLLERR, POLLHUP, POLLIN, POLLNVAL, Pid, TaskEventRecord, w_exit_status, w_if_exited, w_if_signaled, w_term_sig, wait4pid};
+use config_parser::config_reader::ConfigReader;
+use config_parser::validators::{ProcessCount, RestartPolicy};
+use monitoring::{PERF_RECORD_EXIT, POLLERR, POLLHUP, POLLIN, POLLNVAL, Pid, TaskEventRecord, w_exit_status, w_if_exited, w_if_signaled, w_term_sig, wait4pid};
 use monitoring::signalfd::block_sighup;
 use monitoring::{signalfd::SignalFd, PerfCounter, PerfRing, Poller};
 use shell::ShellCommand;
+
 
 pub const SUPERVISOR_TIMEOUT_SEC: u64 = 30;
 
@@ -123,6 +127,22 @@ pub enum SpawnResult {
 }
 
 #[derive(Debug, Default)]
+pub struct ApplyReport {
+    pub kept: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub scaled: usize,
+    pub replaced: usize,
+}
+
+impl fmt::Display for ApplyReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} kept, {} added, {} removed, {} scaled, {} replaced",
+        self.kept, self.added, self.removed, self.scaled, self.replaced)
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct Pending {
     pub queue: VecDeque<SlotOp>,
     pub current: Option<Phase>
@@ -157,6 +177,7 @@ pub struct Supervisor {
     pub names: HashMap<String, ProgramId>,
     pub pid_map: HashMap<c_int, PidKey>,
     pub my_pid: c_int,
+    pub conf_path: PathBuf,
 
     pub rings: Vec<PerfRing>,
     pub counters: Vec<PerfCounter>,
@@ -187,6 +208,7 @@ impl Supervisor {
             names,
             pid_map: HashMap::new(),
             my_pid: std::process::id() as c_int,
+            conf_path: PathBuf::new(),
 
             rings: Vec::new(),
             counters: Vec::new(),
@@ -205,6 +227,28 @@ impl Supervisor {
         self.poller.register(pipe.read_fd());
         self.inbox = Some(pipe.clone());
         Ok(pipe)
+    }
+
+    pub fn get_current_conf(&self) -> Config {
+        let mut program  = HashMap::new();
+        for (name, pid) in &self.names {
+            let conf = self.programs[pid.0 as usize].cfg.clone();
+            program.insert(name.clone(), conf);
+        }
+        Config { program }
+    }
+
+    pub fn reload(&mut self) -> io::Result<ApplyReport>{
+        let mut reader = ConfigReader::new(&self.conf_path);
+        reader.read().map_err(|e| io::Error::other(e.to_string()))?;
+
+        let new_conf = reader.parse::<Config>()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let curr_conf = self.get_current_conf();
+        let diff = ConfigDiff::compute(&curr_conf, &new_conf);
+
+        self.log(&format!("config reload: {} actions computed", diff.actions.len()));
+        Ok(self.apply_diff(diff))
     }
 
     /// Spawn one slot under its program's current cfg.
@@ -288,6 +332,11 @@ impl Supervisor {
     pub fn restart_slot(&mut self, pid: ProgramId, idx: usize) {
         let name =  self.program_names(pid).to_string();
         let prog = &mut self.programs[pid.0 as usize];
+
+        if idx >= prog.cfg.process_count.value as usize {
+            return ;
+        }
+        
         let restart_count = prog.cfg.restart_count;
         let tries = prog.slots[idx].tries;
         let logger = &mut self.logger;
@@ -429,11 +478,13 @@ impl Supervisor {
                     self.clear_current(pid);
                 }
                 Some(Phase::WaitingExit { idx, respawn }) => {
-                    let exited = matches!(
+                    let stoped = matches!(
                         self.programs[prog_idx].slots[idx].state,
-                        SlotState::Exited { .. }
+                        SlotState::Exited { .. } |
+                        SlotState::NotStarted |
+                        SlotState::Backoff
                     );
-                    if !exited {
+                    if !stoped {
                         return Ok(())
                     }
                     if respawn {
@@ -466,6 +517,7 @@ impl Supervisor {
         match slot.state {
             SlotState::Starting { since } if  now.duration_since(since) >= runtime => {
                 slot.state = SlotState::Running { since: now };
+                slot.tries = 0;
                 true
             },
             SlotState::Running { .. } => true,
@@ -481,12 +533,6 @@ impl Supervisor {
 
         self.rings[idx].drain(|header, bytes| {
             match header.type_ {
-                PERF_RECORD_FORK => {
-                    if let Some(record) = TaskEventRecord::try_from_bytes(bytes)
-                        && record.ppid as c_int == my_pid {
-                        eprintln!("New child {} created", record.pid);
-                    }
-                }
                 PERF_RECORD_EXIT => {
                     if let Some(record) = TaskEventRecord::try_from_bytes(bytes)
                         && record.ppid as c_int == my_pid {
@@ -553,6 +599,17 @@ impl Supervisor {
         if let Some(sfd) = &self.sighup {
             let _ = sfd.drain()?;
         }
+        self.log("reload config: SIGHUP received");
+        match self.reload() {
+            Ok(r) => {
+                self.log(&format!(
+                    "reload config: {r} actions applied"
+                ))
+            }
+            Err(e) => {
+                self.log(&format!("config reload failed: {e}"));
+            }
+        }
         Ok(())
     }
 
@@ -609,7 +666,7 @@ impl Supervisor {
 
             if i < n_rings {
                 self.drain_ring(i)?;
-            } else if i == sighup_idx{
+            } else if i == sighup_idx {
                 self.drain_sighup()?;
             } else {
                 if let Some(inbox) = &self.inbox {
@@ -721,7 +778,10 @@ impl Supervisor {
                 }
                 None => format!("unknown program: {name}")
             }
-            ShellCommand::Reload => "reloading configuration".into(),
+            ShellCommand::Reload => match self.reload() {
+                Ok(r) => format!("reload {r}"),
+                Err(e) => format!("reload: failed with {e}")
+            }
             ShellCommand::Quit => {
                 self.begin_shutdown(Duration::from_secs(SUPERVISOR_TIMEOUT_SEC));
                 "quitting ...".into()
@@ -738,7 +798,8 @@ impl Supervisor {
         for name in names {
             let id = self.names[name];
             let prog = &self.programs[id.0 as usize];
-            for (i, slot) in prog.slots.iter().enumerate() {
+            let active = prog.cfg.process_count.value as usize;
+            for (i, slot) in prog.slots.iter().enumerate().take(active) {
                 out.push_str(&format!("{name}[{i}]: {}\n", slot.state));
             }
         }
@@ -770,6 +831,102 @@ impl Supervisor {
                 SlotState::Stopping { .. }
             });
         !pending || Instant::now() >= deadline
+    }
+
+    fn apply_diff(&mut self, diff: ConfigDiff) -> ApplyReport {
+        let mut report = ApplyReport::default();
+        for action in diff.actions {
+            match action {
+                DiffAction::Keep { name } => {
+                    self.log(&format!("program {name}: kept"));
+                    report.kept += 1;
+                }
+                DiffAction::Add { name, cfg } => {
+                    self.add_program(name, cfg);
+                    report.added += 1;
+                }
+                DiffAction::Remove { name } => {
+                    self.remove_program(&name);
+                    report.removed += 1;
+                }
+                DiffAction::Replace { name, new_cfg, .. } => {
+                    self.replace_program(&name, new_cfg);
+                    report.replaced += 1;
+                }
+                DiffAction::Scale { name, old_count, new_count } => {
+                    self.scale_program(&name, old_count, new_count);
+                    report.scaled += 1;
+                }
+            }
+        }
+        report
+    }
+
+    fn add_program(&mut self, name: String, conf: ProgramConfig) {
+        let id = ProgramId(self.programs.len() as u32);
+        let count = conf.process_count.value as usize;
+        let auto_start = conf.auto_start;
+        let slots = (0..count).map(|_| Slot::new()).collect();
+
+        self.programs.push(Program { cfg: conf, slots, pending: None });
+        self.names.insert(name.clone(), id);
+        self.log(&format!("program {name}: added {count} instances"));
+
+        if auto_start {
+            for i in 0..count {
+                let _ = self.spawn_slot(id, i);
+            }
+        }
+
+    }
+    fn remove_program(&mut self, name: &str) {
+        let Some(pid) = self.names.get(name).copied() else { return; };
+        self.stop_all(pid);
+        self.names.remove(name);
+        self.log(&format!("program {name}: removed"))
+    }
+
+    fn scale_program(&mut self, name: &str, from: usize, to: usize) {
+        let Some(pid) = self.names.get(name).copied() else { return; };
+        self.programs[pid.0 as usize].cfg.process_count = ProcessCount::try_from(to as u64)
+            .expect("validated by ProgamDelta");
+        let auto_start = self.programs[pid.0 as usize].cfg.auto_start;
+        
+        if to > from {
+            // spawn
+            self.programs[pid.0 as usize].slots.resize_with(to, Slot::new);
+            if auto_start {
+                for i in from..to {
+                    let _ = self.spawn_slot(pid, i);
+                }
+            };
+        } else {
+            // despawn
+            for i in to..from {
+                let _ = self.stop_slot(pid, i);
+            }
+        }
+        self.log(&format!("program {name}: scaled from {from} to {to}"));
+    }
+    
+    fn replace_program(&mut self, name: &str, new_conf: ProgramConfig) {
+        let Some(pid) = self.names.get(name).copied() else { return; };
+        let new_count = new_conf.process_count.value as usize;
+        let old_count = self.programs[pid.0 as usize].slots.len();
+
+        for i in new_count..old_count {
+            let _ = self.stop_slot(pid, i);
+        }
+
+        self.programs[pid.0 as usize].cfg = new_conf;
+
+        if new_count != old_count {
+            // fit max
+            self.programs[pid.0 as usize].slots
+            .resize_with(new_count.max(old_count), Slot::new);
+        }
+        self.programs[pid.0 as usize].pending = Some(Pending::replace_all(new_count));
+        self.log(&format!("program {name}: replaced and now has {new_count} instances"));
     }
 }
 
@@ -1478,19 +1635,32 @@ mod tests {
     }
 
     #[test]
-    fn apply_command_start_enqueues_grow() {
-        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().expect("signal lock");
+    fn apply_command_start_spawns_slots_in_parallel() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let mut raw = Config { program: HashMap::new() };
-        raw.program.insert("web".into(), program_cfg(2));
+        let mut cfg = program_cfg(2);
+        cfg.command = Command::try_from("/bin/sleep 10".to_string()).unwrap();
+        raw.program.insert("web".into(), cfg);
 
         let mut sup = Supervisor::new(raw);
         let resp = sup.apply_command(shell::ShellCommand::Start("web".into()));
 
         let id = sup.names["web"];
-        assert!(sup.programs[id.0 as usize].pending.is_some(),
-                "start must enqueue a walk");
-        assert!(resp.contains("program web"));
-        assert!(resp.contains("2 instances"));
+        let p  = &sup.programs[id.0 as usize];
+
+        // Parallel spawn, no walk.
+        assert!(p.pending.is_none(), "start no longer uses a walk");
+        assert!(matches!(p.slots[0].state, SlotState::Starting { .. }));
+        assert!(matches!(p.slots[1].state, SlotState::Starting { .. }));
+        assert!(resp.contains("web"));
+        assert!(resp.contains("2"));
+
+        // Cleanup — don't leak the two sleepers.
+        use crate::unix::{send_signal, SIGKILL};
+        for s in &p.slots {
+            if let Some(pid) = s.pid { let _ = send_signal(pid, SIGKILL); }
+        }
     }
 
     #[test]
@@ -1501,5 +1671,219 @@ mod tests {
 
         let resp = sup.apply_command(shell::ShellCommand::Stop("db".into()));
         assert!(resp.contains("unknown program: db"));
+    }
+    
+    #[cfg(test)]
+    mod apply_tests {
+        use super::*;
+        use crate::diff::{ConfigDiff, DiffAction};
+        // reuse program_cfg from the outer tests module
+
+    #[test]
+    fn keep_action_changes_nothing() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut raw = Config { program: HashMap::new() };
+        raw.program.insert("web".into(), program_cfg(2));
+        let mut sup = Supervisor::new(raw);
+
+        let diff = ConfigDiff { actions: vec![DiffAction::Keep { name: "web".into() }] };
+        let r = sup.apply_diff(diff);
+
+        assert_eq!(r.kept, 1);
+        let id = sup.names["web"];
+        assert!(matches!(sup.programs[id.0 as usize].slots[0].state, SlotState::NotStarted));
+    }
+
+        #[test]
+        fn add_action_creates_program_and_autostarts() {
+            let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut sup = Supervisor::new(Config { program: HashMap::new() });
+            sup.bootstrap().unwrap();
+
+            let mut cfg = program_cfg(1);
+            cfg.command = Command::try_from("/bin/sleep 10".to_string()).unwrap();
+            cfg.auto_start = true;
+            let diff = ConfigDiff { actions: vec![DiffAction::Add {
+                name: "web".into(),
+                cfg,
+            }] };
+
+            let r = sup.apply_diff(diff);
+            assert_eq!(r.added, 1);
+            let id = sup.names["web"];
+            assert!(matches!(sup.programs[id.0 as usize].slots[0].state, SlotState::Starting { .. }));
+
+            // cleanup
+            cleanup(&mut sup);
+        }
+
+        #[test]
+        fn remove_action_stops_slots_and_drops_name() {
+            let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cfg = sample_config("web", 1);
+            cfg.program.get_mut("web").unwrap().command =
+                Command::try_from("/bin/sleep 10".to_string()).unwrap();
+            let mut sup = Supervisor::new(cfg);
+            sup.bootstrap().unwrap();
+            sup.auto_start();                                      // slot now Starting
+
+            let diff = ConfigDiff { actions: vec![DiffAction::Remove { name: "web".into() }] };
+            sup.apply_diff(diff);
+
+            assert!(!sup.names.contains_key("web"));
+            // Still in programs vec, now Stopping.
+            assert!(matches!(sup.programs[0].slots[0].state, SlotState::Stopping { .. }));
+
+            cleanup(&mut sup);
+        }
+
+        #[test]
+        fn scale_up_adds_slots_and_spawns_them() {
+            let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cfg = sample_config("web", 1);
+            cfg.program.get_mut("web").unwrap().command =
+                Command::try_from("/bin/sleep 10".to_string()).unwrap();
+            let mut sup = Supervisor::new(cfg);
+            sup.bootstrap().unwrap();
+
+            let diff = ConfigDiff { actions: vec![DiffAction::Scale {
+                name: "web".into(), old_count: 1, new_count: 3,
+            }] };
+            sup.apply_diff(diff);
+
+            let p = &sup.programs[0];
+            assert_eq!(p.slots.len(), 3);
+            // Slot 0 was NotStarted (we never auto-started); 1 and 2 got spawned.
+            assert!(matches!(p.slots[1].state, SlotState::Starting { .. }));
+            assert!(matches!(p.slots[2].state, SlotState::Starting { .. }));
+
+            cleanup(&mut sup);
+        }
+
+        #[test]
+        fn scale_down_stops_trailing_slots() {
+            let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cfg = sample_config("web", 3);
+            cfg.program.get_mut("web").unwrap().command =
+                Command::try_from("/bin/sleep 10".to_string()).unwrap();
+            let mut sup = Supervisor::new(cfg);
+            sup.bootstrap().unwrap();
+            sup.auto_start();                                      // all 3 Starting
+
+            let diff = ConfigDiff { actions: vec![DiffAction::Scale {
+                name: "web".into(), old_count: 3, new_count: 1,
+            }] };
+            sup.apply_diff(diff);
+
+            let p = &sup.programs[0];
+            assert!(matches!(p.slots[0].state, SlotState::Starting { .. }));
+            assert!(matches!(p.slots[1].state, SlotState::Stopping { .. }));
+            assert!(matches!(p.slots[2].state, SlotState::Stopping { .. }));
+
+            cleanup(&mut sup);
+        }
+
+        #[test]
+        fn replace_swaps_cfg_and_enqueues_rolling_walk() {
+            let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cfg = sample_config("web", 2);
+            cfg.program.get_mut("web").unwrap().command =
+                Command::try_from("/bin/sleep 10".to_string()).unwrap();
+            let mut sup = Supervisor::new(cfg);
+            sup.bootstrap().unwrap();
+            sup.auto_start();
+
+            let mut new_cfg = program_cfg(2);
+            new_cfg.command = Command::try_from("/bin/sleep 20".to_string()).unwrap();
+            new_cfg.auto_start = false;
+
+            let diff = ConfigDiff { actions: vec![DiffAction::Replace {
+                name: "web".into(),
+                old_cfg:  sup.programs[0].cfg.clone(),
+                new_cfg:  new_cfg.clone(),
+            }] };
+            sup.apply_diff(diff);
+
+            assert_eq!(sup.programs[0].cfg, new_cfg);
+            assert!(sup.programs[0].pending.is_some());
+
+            cleanup(&mut sup);
+        }
+    }
+
+    // Helpers used by the apply tests
+    fn sample_config(name: &str, count: u64) -> Config {
+        let mut c = Config { program: HashMap::new() };
+        c.program.insert(name.into(), program_cfg(count));
+        c
+    }
+
+    fn cleanup(sup: &mut Supervisor) {
+        use crate::unix::{send_signal, SIGKILL};
+        for p in &sup.programs {
+            for s in &p.slots {
+                if let Some(pid) = s.pid {
+                    let _ = send_signal(pid, SIGKILL);
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            sup.step().ok();
+            let any_alive = sup.programs.iter()
+                .flat_map(|p| p.slots.iter()).any(|s| s.pid.is_some());
+            if !any_alive { break; }
+        }
+    }
+
+    #[test]
+    fn reload_with_added_program_runs_add_action() {
+        let _lock = SIGNAL_HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Start empty.
+        let mut sup = Supervisor::new(Config { program: HashMap::new() });
+
+        // Write a config file with one new program.
+        let dir = std::env::temp_dir().join(format!(
+            "taskmaster-reload-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let cfg_path = dir.join("reload.toml");
+        std::fs::write(&cfg_path, format!(
+            r#"
+    [program.sleeper]
+    command = "/bin/sleep 10"
+    chdir = "{}"
+    process_count = 1
+    auto_start = false
+    restart_protocol = "never"
+    exit_codes = [0]
+    runtime = 0
+    restart_count = 0
+    exit_signal = "TERM"
+    kill_time = 1
+    "#,
+            dir.display()
+        )).unwrap();
+
+        sup.conf_path = cfg_path;
+        let report = sup.reload().expect("reload must succeed");
+        assert_eq!(report.added, 1);
+        assert!(sup.names.contains_key("sleeper"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reload_from_missing_file_returns_error() {
+        let mut sup = Supervisor::new(Config { program: HashMap::new() });
+        sup.conf_path = PathBuf::from("/nonexistent/path/Run.toml");
+
+        assert!(sup.reload().is_err());
+        // Supervisor state unchanged.
+        assert!(sup.names.is_empty());
+        assert!(sup.programs.is_empty());
     }
 }

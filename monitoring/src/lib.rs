@@ -588,14 +588,20 @@ impl Poller {
     }
 
     pub fn wait(&mut self, timeout_ms: c_int) -> io::Result<Readiness<'_>> {
-        for pfd in &mut self.fds {
-            pfd.revents = 0;
-        };
-        let rc = unsafe { poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, timeout_ms) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
+        loop {   
+            for pfd in &mut self.fds {
+                pfd.revents = 0;
+            };
+            let rc = unsafe { poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, timeout_ms) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue ;
+                }
+                return Err(err);
+            }
+            return Ok(Readiness { fds: &self.fds })
         }
-        Ok(Readiness { fds: &self.fds })
     }
 }
 
