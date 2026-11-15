@@ -36,24 +36,30 @@ fn run() -> Result<(), Box<dyn std::error::Error> > {
     println!("taskmaster started - type `quit` to exit, `status` to inspect");
 
     let (tx, rx) = mpsc::channel::<ShellCommand>();
+    let (resp_tx, resp_rx) = mpsc::channel::<String>();
     let shell_inbox = inbox.clone();
-    thread::spawn(move || shell_loop(tx, shell_inbox));
+    let shell = thread::spawn(move || shell_loop(tx, resp_rx, shell_inbox));
+    let mut shell_quit = false;
 
     loop {
         sup.step()?;
 
         while let Ok(cmd) = rx.try_recv() {
+            if matches!(cmd, ShellCommand::Quit) {
+                shell_quit = true;
+            }
             let resp = sup.apply_command(cmd);
-            println!("\r{resp}");
+            let _ = resp_tx.send(resp);
         }
         if sup.is_shutdown_done() { break; }
     }
 
+    if shell_quit { let _ = shell.join(); }
     println!("sayounara!");
 	Ok(())
 }
 
-fn shell_loop(tx: mpsc::Sender<ShellCommand>, inbox: Arc<SelfPipe>) {
+fn shell_loop(tx: mpsc::Sender<ShellCommand>, resp_rx: mpsc::Receiver<String>, inbox: Arc<SelfPipe>) {
     let mut reader = match Reader::new() {
         Ok(r) => r,
         Err(err) => {
@@ -69,6 +75,10 @@ fn shell_loop(tx: mpsc::Sender<ShellCommand>, inbox: Arc<SelfPipe>) {
                 let is_quit = matches!(cmd, ShellCommand::Quit);
                 if tx.send(cmd).is_err() { return; }
                 let _ = inbox.notify();
+                match resp_rx.recv() {
+                    Ok(resp) => println!("\r{resp}"),
+                    Err(_) => return,
+                }
                 if is_quit { return; }
             }
             Err(err) => eprintln!("parse error: {err:?}"),
@@ -77,4 +87,7 @@ fn shell_loop(tx: mpsc::Sender<ShellCommand>, inbox: Arc<SelfPipe>) {
 
     let _ = tx.send(ShellCommand::Quit);
     let _ = inbox.notify();
+    if let Ok(resp) = resp_rx.recv() {
+        println!("\r{resp}");
+    }
 }
