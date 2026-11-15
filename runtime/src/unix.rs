@@ -26,6 +26,8 @@ pub const SIG_SETMASK: c_int  = 2;
 pub const SIGSTOP: c_int = 19;
 const SIG_DFL: usize = 0;
 const LAST_STANDARD_SIGNAL: c_int = 31;
+const STDIN_FILENO: c_int = 0;
+const TCSANOW: c_int = 0;
 
 static SIGCHLD_WRITE_FD: AtomicI32  = AtomicI32::new(-1);
 
@@ -49,6 +51,20 @@ union SignalHandler {
 #[repr(C)]
 struct SigSet {
 	value: [c_ulong;16],
+}
+
+/// `struct termios` (glibc, Linux).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Termios {
+	c_iflag: c_uint,
+	c_oflag: c_uint,
+	c_cflag: c_uint,
+	c_lflag: c_uint,
+	c_line: u8,
+	c_cc: [u8; 32],
+	c_ispeed: c_uint,
+	c_ospeed: c_uint
 }
 
 #[repr(C)]
@@ -83,6 +99,37 @@ unsafe extern "C" {
 	fn umask(mask: c_uint) -> c_uint;
 	fn kill(pid: c_int, sig: c_int) -> c_int;
 	fn signal(signum: c_int, handler: usize) -> usize;
+	fn isatty(fd: c_int) -> c_int;
+	fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
+	fn tcsetattr(fd: c_int, optional_actions: c_int, termios: *const Termios) -> c_int;
+}
+
+pub struct TerminalState {
+	saved: Termios
+}
+
+impl TerminalState {
+	/// `None` when stdin is not a terminal (pipe, file).
+	pub fn save() -> Option<Self> {
+		// SAFETY: `saved` is a valid, writable termios; it is only used if tcgetattr succeeds.
+		unsafe {
+			if isatty(STDIN_FILENO) != 1 {
+				return None;
+			}
+			let mut saved = std::mem::zeroed::<Termios>();
+			if tcgetattr(STDIN_FILENO, &mut saved) == -1 {
+				return None;
+			}
+			Some(Self { saved })
+		}
+	}
+
+	pub fn restore(&self) {
+		// SAFETY: `saved` was filled by tcgetattr on the same fd.
+		unsafe {
+			tcsetattr(STDIN_FILENO, TCSANOW, &self.saved);
+		}
+	}
 }
 
 pub fn set_umask(mask: u16) {

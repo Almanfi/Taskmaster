@@ -6,7 +6,7 @@ use config_parser::config_reader::ConfigReader;
 use config_parser::config::Config;
 use runtime::log::Logger;
 use runtime::supervisor::Supervisor;
-use runtime::unix::SelfPipe;
+use runtime::unix::{SelfPipe, TerminalState};
 use shell::{Reader, ShellCommand};
 
 
@@ -35,6 +35,7 @@ fn run() -> Result<(), Box<dyn std::error::Error> > {
 
     println!("taskmaster started - type `quit` to exit, `status` to inspect");
 
+    let terminal = TerminalState::save();
     let (tx, rx) = mpsc::channel::<ShellCommand>();
     let (resp_tx, resp_rx) = mpsc::channel::<String>();
     let shell_inbox = inbox.clone();
@@ -55,6 +56,7 @@ fn run() -> Result<(), Box<dyn std::error::Error> > {
     }
 
     if shell_quit { let _ = shell.join(); }
+    if let Some(terminal) = &terminal { terminal.restore(); }
     println!("sayounara!");
 	Ok(())
 }
