@@ -3,6 +3,10 @@ use std::os::fd::RawFd;
 
 /// Config-reload signal. The only signal we deliver via signalfd.
 pub const SIGHUP: c_int = 1;
+/// Shutdown signals, delivered through their own signalfd.
+pub const SIGINT: c_int = 2;
+pub const SIGQUIT: c_int = 3;
+pub const SIGTERM: c_int = 15;
 pub const SIG_BLOCK: c_int = 0;
 
 // --- signalfd consttants ---
@@ -77,6 +81,15 @@ pub fn block_sighup() -> std::io::Result<()> {
     procmask(SIG_BLOCK, &set)
 }
 
+pub fn block_shutdown_signals() -> std::io::Result<()> {
+    let mut set = SigSet::empty();
+    emptyset(&mut set)?;
+    addset(&mut set, SIGINT)?;
+    addset(&mut set, SIGQUIT)?;
+    addset(&mut set, SIGTERM)?;
+    procmask(SIG_BLOCK, &set)
+}
+
 pub struct SignalFd {
     fd: RawFd,
 }
@@ -91,6 +104,28 @@ impl SignalFd {
         let mut mask = SigSet::empty();
         emptyset(&mut mask)?;
         addset(&mut mask, SIGHUP)?;
+
+        // SAFETY: mask is live and well-formed; fd=-1 asks the kernel to
+        // allocate a fresh signalfd.
+        let fd = unsafe {
+            signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK)
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    /// Open a signalfd that delivers SIGINT, SIGQUIT and SIGTERM. Blocks them
+    /// process-wide first, for the same reason as `open_sighup`.
+    pub fn open_shutdown() -> std::io::Result<Self> {
+        block_shutdown_signals()?;
+
+        let mut mask = SigSet::empty();
+        emptyset(&mut mask)?;
+        addset(&mut mask, SIGINT)?;
+        addset(&mut mask, SIGQUIT)?;
+        addset(&mut mask, SIGTERM)?;
 
         // SAFETY: mask is live and well-formed; fd=-1 asks the kernel to
         // allocate a fresh signalfd.

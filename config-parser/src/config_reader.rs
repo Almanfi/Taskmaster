@@ -21,7 +21,7 @@ impl fmt::Display for ConfigReaderError {
 		match self {
 			Self::FileNotReadable(file_path) => write!(f, "Couldn't read file `{file_path}`"),
 			Self::NotLoaded => write!(f, "Nof file content is loaded"),
-			Self::ParseError(err) => write!(f, "Failed to parse YAML configuration: {err}")
+			Self::ParseError(err) => write!(f, "Failed to parse TOML configuration: {err}")
 		}
 	}
 }

@@ -23,6 +23,9 @@ pub const WNOHANG: c_int = 1;
 pub const ECHILD: c_int = 10;
 pub const SIG_BLOCK: c_int = 0;
 pub const SIG_SETMASK: c_int  = 2;
+pub const SIGSTOP: c_int = 19;
+const SIG_DFL: usize = 0;
+const LAST_STANDARD_SIGNAL: c_int = 31;
 
 static SIGCHLD_WRITE_FD: AtomicI32  = AtomicI32::new(-1);
 
@@ -79,12 +82,30 @@ unsafe extern "C" {
 	fn raise(signum: c_int) -> c_int;
 	fn umask(mask: c_uint) -> c_uint;
 	fn kill(pid: c_int, sig: c_int) -> c_int;
+	fn signal(signum: c_int, handler: usize) -> usize;
 }
 
 pub fn set_umask(mask: u16) {
 	unsafe {
 		umask(mask.into());
 	}
+}
+
+pub fn reset_child_signals() -> io::Result<()> {
+	let mut empty = SigSet { value: [0; 16] };
+	// SAFETY: `empty` is a valid, writable sigset; a null old set is allowed.
+	unsafe {
+		sigemptyset(&mut empty);
+		if sigprocmask(SIG_SETMASK, &empty, std::ptr::null_mut()) == -1 {
+			return Err(io::Error::last_os_error());
+		}
+		for sig in 1..=LAST_STANDARD_SIGNAL {
+			if sig != SIGKILL && sig != SIGSTOP {
+				signal(sig, SIG_DFL);
+			}
+		}
+	}
+	Ok(())
 }
 
 pub fn send_signal(pid: c_int, sig: c_int) -> io::Result<()> {

@@ -15,7 +15,7 @@ use config_parser::config::{Config, ProgramConfig};
 use config_parser::config_reader::ConfigReader;
 use config_parser::validators::{ProcessCount, RestartPolicy};
 use monitoring::{PERF_RECORD_EXIT, POLLERR, POLLHUP, POLLIN, POLLNVAL, Pid, TaskEventRecord, w_exit_status, w_if_exited, w_if_signaled, w_term_sig, wait4pid};
-use monitoring::signalfd::block_sighup;
+use monitoring::signalfd::{block_sighup, block_shutdown_signals};
 use monitoring::{signalfd::SignalFd, PerfCounter, PerfRing, Poller};
 use shell::ShellCommand;
 
@@ -44,7 +44,8 @@ pub enum SlotState {
     NotStarted,
     Starting    { since: Instant },
     Running     { since: Instant },
-    Stopping     { since: Instant, deadline: Instant},
+    Stopping     { since: Instant, deadline: Instant, killed: bool},
+    Stopped,
     Exited      { term: Termination, expected: bool },
     Backoff
 }
@@ -62,7 +63,7 @@ impl fmt::Display for SlotState {
                 write!(f, "running ({}s:{}ms)", since.elapsed().as_secs(), since.elapsed().subsec_millis())
             }
 
-            SlotState::Stopping { since, deadline } => {
+            SlotState::Stopping { since, deadline, .. } => {
                 let now = Instant::now();
                 let elapsed   = since.elapsed().as_secs();
                 let remaining = deadline.saturating_duration_since(now).as_secs();
@@ -80,6 +81,7 @@ impl fmt::Display for SlotState {
             }
 
             SlotState::Backoff => write!(f, "backoff"),
+            SlotState::Stopped => write!(f, "stopped"),
         }
     }
 }
@@ -182,6 +184,7 @@ pub struct Supervisor {
     pub rings: Vec<PerfRing>,
     pub counters: Vec<PerfCounter>,
     pub sighup: Option<SignalFd>,
+    pub shutdown_sig: Option<SignalFd>,
     pub inbox: Option<Arc<SelfPipe>>,
     pub poller: Poller,
 
@@ -213,6 +216,7 @@ impl Supervisor {
             rings: Vec::new(),
             counters: Vec::new(),
             sighup: None,
+            shutdown_sig: None,
             inbox: None,
             poller: Poller::new(),
 
@@ -283,7 +287,6 @@ impl Supervisor {
         let slot = &mut self.programs[prog_idx].slots[slot_idx];
         slot.pid = Some(pid);
         slot.state = SlotState::Starting { since: (Instant::now()) };
-        slot.tries = slot.tries.saturating_add(1);
         
         self.pid_map.insert(pid, PidKey { program, slot: slot_idx });
         Ok(SpawnResult::Spawned)
@@ -323,7 +326,7 @@ impl Supervisor {
 
         let now = Instant::now();
         let slot = &mut self.programs[prog_idx].slots[slot_idx];
-        slot.state = SlotState::Stopping { since: now, deadline: now + Duration::from_secs(kill_time) };
+        slot.state = SlotState::Stopping { since: now, deadline: now + Duration::from_secs(kill_time), killed: false };
         Ok(())
     }
 
@@ -348,6 +351,7 @@ impl Supervisor {
             ));
             return ; 
         }
+        prog.slots[idx].tries = tries + 1;
         logger.log(&format!(
             "restart program={name} slot={idx} try={}", tries + 1
         ));
@@ -376,11 +380,11 @@ impl Supervisor {
                     slot.state = SlotState::Running { since };
                     slot.tries = 0;
                 }
-                // SIGKILL escalation (unchanged from S07).
-                if let SlotState::Stopping { deadline, .. } = slot.state 
+                if let SlotState::Stopping { since, deadline, killed: false } = slot.state 
                     && now >= deadline
                     && let Some(pid) = slot.pid {
                         let _ = send_signal(pid, SIGKILL);
+                        slot.state = SlotState::Stopping { since, deadline, killed: true };
                         kill_events.push((prog_idx, slot_idx, pid))
                 }
             }
@@ -403,6 +407,7 @@ impl Supervisor {
         // SIGHUP must be blocked on this thread *before* signalfd opens,
         // otherwise the default disposition (terminate) stays armed.
         block_sighup()?;
+        block_shutdown_signals()?;
 
         let n_cpus = available_parallelism()
             .map_err(|e| io::Error::other(e.to_string()))?
@@ -422,6 +427,10 @@ impl Supervisor {
         let sighup = SignalFd::open_sighup()?;
         self.poller.register(sighup.as_raw_fd());
         self.sighup = Some(sighup);
+
+        let shutdown_sig = SignalFd::open_shutdown()?;
+        self.poller.register(shutdown_sig.as_raw_fd());
+        self.shutdown_sig = Some(shutdown_sig);
 
         Ok(())
     }
@@ -471,7 +480,7 @@ impl Supervisor {
                 }
                 Some(Phase::WaitingRunning { idx }) => {
                     let state = self.programs[prog_idx].slots[idx].state;
-                    let failed = matches!(state, SlotState::Exited { .. } | SlotState::Backoff);
+                    let failed = matches!(state, SlotState::Exited { .. } | SlotState::Backoff | SlotState::Stopped);
                     if !failed && !self.has_stabilized(pid, idx, now) {
                         return Ok(());
                     }
@@ -482,6 +491,7 @@ impl Supervisor {
                         self.programs[prog_idx].slots[idx].state,
                         SlotState::Exited { .. } |
                         SlotState::NotStarted |
+                        SlotState::Stopped |
                         SlotState::Backoff
                     );
                     if !stoped {
@@ -574,8 +584,13 @@ impl Supervisor {
         let expected = class == ExitClass::Expected;
 
         let slot = &mut self.programs[key.program.0 as usize].slots[key.slot];
+        let requested_stop = matches!(slot.state, SlotState::Stopping { .. });
         slot.pid = None;
-        slot.state = SlotState::Exited { term: termination, expected };
+        slot.state = if requested_stop {
+            SlotState::Stopped
+        } else {
+            SlotState::Exited { term: termination, expected }
+        };
 
         let name = self.program_names(key.program).to_string();
         let description = match termination {
@@ -587,7 +602,7 @@ impl Supervisor {
             key.slot
         ));
 
-        if matches!(self.decide_restart(key.program, class), RestartDecision::Restart) {
+        if !requested_stop && matches!(self.decide_restart(key.program, class), RestartDecision::Restart) {
             self.restart_slot(key.program, key.slot);
         }
         Ok(())
@@ -613,12 +628,28 @@ impl Supervisor {
         Ok(())
     }
 
+    /// SIGINT / SIGQUIT / SIGTERM: same graceful shutdown as the `quit` command.
+    fn drain_shutdown(&mut self) -> io::Result<()> {
+        if let Some(sfd) = &self.shutdown_sig {
+            let _ = sfd.drain()?;
+        }
+        if self.shutdown_deadline.is_none() {
+            self.log("shutdown signal received");
+            self.begin_shutdown(Duration::from_secs(SUPERVISOR_TIMEOUT_SEC));
+        }
+        Ok(())
+    }
+
     fn next_timeout_ms(&self) -> c_int {
         let now = Instant::now();
         let soonest_stop = self.programs.iter()
-            .flat_map(|p| p.slots.iter())
-            .filter_map(|s| match s.state {
-                SlotState::Stopping { deadline, ..} => Some(deadline),
+            .flat_map(|p| {
+                let runtime = Duration::from_secs(p.cfg.runtime as u64);
+                p.slots.iter().map(move |s| (s, runtime))
+            })
+            .filter_map(|(s, runtime)| match s.state {
+                SlotState::Stopping { deadline, killed: false, ..} => Some(deadline),
+                SlotState::Starting { since } => Some(since + runtime),
                 _ => None,
             }).min();
         
@@ -659,6 +690,7 @@ impl Supervisor {
         // 5. Dispatch events
         let n_rings = self.rings.len();
         let sighup_idx = n_rings;
+        let shutdown_idx = n_rings + 1;
 
         for (i, revents) in ready_pairs {
             if revents & (POLLERR | POLLNVAL) != 0 { continue; }
@@ -668,6 +700,8 @@ impl Supervisor {
                 self.drain_ring(i)?;
             } else if i == sighup_idx {
                 self.drain_sighup()?;
+            } else if i == shutdown_idx {
+                self.drain_shutdown()?;
             } else {
                 if let Some(inbox) = &self.inbox {
                     let _ = inbox.drain();
@@ -747,7 +781,10 @@ impl Supervisor {
                     
                     for slot in 0..count {
                         match self.spawn_slot(id, slot) {
-                            Ok(SpawnResult::Spawned) => started += 1,
+                            Ok(SpawnResult::Spawned) => {
+                                self.programs[id.0 as usize].slots[slot].tries = 0;
+                                started += 1
+                            }
                             Ok(SpawnResult::AlredyRunning) => running += 1,
                             Ok(SpawnResult::Stopping) => stopping += 1,
                             Err(e) => self.log(
@@ -1047,7 +1084,7 @@ mod tests {
 
         let slot = &sup.programs[id.0 as usize].slots[0];
         match slot.state {
-            SlotState::Stopping { since, deadline } => {
+            SlotState::Stopping { since, deadline, .. } => {
                 assert!(since >= before && since <= after);
                 assert_eq!(deadline - since, Duration::from_secs(5));
             }
@@ -1537,7 +1574,7 @@ mod tests {
         let id = sup.names["p"];
         sup.spawn_slot(id, 0).expect("spawn");
 
-        assert_eq!(sup.programs[id.0 as usize].slots[0].tries, 1);
+        sup.programs[id.0 as usize].slots[0].tries = 2;
 
         sup.tick(Instant::now());
 

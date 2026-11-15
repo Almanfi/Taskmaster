@@ -1,6 +1,6 @@
 use std::process::{Command, Stdio};
 use config_parser::config::ProgramConfig;
-use crate::unix::{ChildTermination, set_umask};
+use crate::unix::{ChildTermination, reset_child_signals, set_umask};
 use std::error::Error;
 use std::os::unix::process::CommandExt;
 
@@ -81,6 +81,9 @@ impl<'a> RuntimeProcess<'a>{
 			Some(target) => command.stderr(target.open_stream()?),
 			None => command.stderr(Stdio::null())
 		};	
+		unsafe {
+			command.pre_exec(reset_child_signals);
+		}
 		if let Some(mask) = self.config.umask.as_ref().map(|mask| mask.value){
 			unsafe {
 				command.pre_exec(move || {
